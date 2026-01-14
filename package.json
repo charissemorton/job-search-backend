@@ -1,0 +1,8 @@
+{
+  "name": "job-search-assistant-backend",
+  "version": "1.0.0",
+  "description": "Serverless backend for Job Search Assistant",
+  "dependencies": {
+    "node-fetch": "^2.6.7"
+  }
+}
