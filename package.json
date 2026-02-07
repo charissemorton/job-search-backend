@@ -1,9 +1,0 @@
-{
-  "name": "matchmentum-functions",
-  "version": "1.0.0",
-  "description": "Serverless functions for MatchMentum",
-  "dependencies": {
-    "stripe": "^14.11.0",
-    "@supabase/supabase-js": "^2.39.0"
-  }
-}
