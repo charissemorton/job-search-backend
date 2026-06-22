@@ -28,7 +28,6 @@ exports.handler = async (event, context) => {
 
   // Get API key from environment variable (set in Netlify dashboard)
   const apiKey = process.env.ANTHROPIC_API_KEY;
-
   if (!apiKey) {
     return {
       statusCode: 500,
@@ -53,8 +52,9 @@ exports.handler = async (event, context) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-opus-4-6',
+        model: 'claude-sonnet-4-6',
         max_tokens: maxTokens,
+        thinking: { type: 'disabled' },
         system: systemPrompt,
         messages: [
           {
