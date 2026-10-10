@@ -37,7 +37,7 @@ export default async (request) => {
   }
 
   try {
-    const { systemPrompt, userMessage, maxTokens = 4000 } = await request.json();
+    const { systemPrompt, userMessage, maxTokens = 4000, temperature = 0 } = await request.json();
 
     // Make streaming request to Anthropic API
     const anthropicResponse = await fetch('https://api.anthropic.com/v1/messages', {
@@ -50,6 +50,7 @@ export default async (request) => {
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
         max_tokens: maxTokens,
+        temperature: temperature,
         stream: true,
         system: systemPrompt,
         messages: [
