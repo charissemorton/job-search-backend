@@ -111,6 +111,7 @@ async function handleCheckoutComplete(session) {
             user_id: userId,
             tier: resolvedTier,
             status: 'active',
+            trial_expires_at: null,
             stripe_subscription_id: subscriptionId,
             stripe_customer_id: customerId,
             current_period_start: periodStart,
@@ -201,6 +202,7 @@ async function handleSubscriptionUpdated(subscription) {
     const updateData = {
         tier: newTier,
         status: status,
+        trial_expires_at: null,
         analyses_limit: limits.analyses,
         resumes_limit: limits.resumes,
         covers_limit: limits.covers,
@@ -245,6 +247,7 @@ async function handleSubscriptionDeleted(subscription) {
         .update({
             tier: 'free',
             status: 'canceled',
+            trial_expires_at: new Date().toISOString(), // read-only immediately after cancellation
             analyses_used: 0,
             analyses_limit: limits.analyses,
             resumes_used: 0,
