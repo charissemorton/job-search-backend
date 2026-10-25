@@ -25,6 +25,21 @@ const TIER_LIMITS = {
     pro: { analyses: null, resumes: null, covers: null }
 };
 
+/**
+ * PROD-54: read a subscription's billing period from either Stripe field layout.
+ * API versions from 2025-03-31 moved current_period_start/end from the
+ * subscription to its items. Returns ISO strings, or nulls if neither is present.
+ */
+function getPeriodDates(sub) {
+    const item = sub?.items?.data?.[0];
+    const start = sub?.current_period_start ?? item?.current_period_start;
+    const end = sub?.current_period_end ?? item?.current_period_end;
+    return {
+        periodStart: start ? new Date(start * 1000).toISOString() : null,
+        periodEnd: end ? new Date(end * 1000).toISOString() : null
+    };
+}
+
 exports.handler = async (event) => {
     if (event.httpMethod !== 'POST') {
         return { statusCode: 405, body: 'Method Not Allowed' };
@@ -97,8 +112,7 @@ async function handleCheckoutComplete(session) {
 
     if (subscriptionId) {
         const sub = await stripe.subscriptions.retrieve(subscriptionId);
-        periodStart = new Date(sub.current_period_start * 1000).toISOString();
-        periodEnd = new Date(sub.current_period_end * 1000).toISOString();
+        ({ periodStart, periodEnd } = getPeriodDates(sub));
     }
 
     const resolvedTier = tier || 'pro'; // Fallback for legacy checkouts
@@ -141,7 +155,9 @@ async function handleCheckoutComplete(session) {
  */
 async function handleInvoicePaid(invoice) {
     const customerId = invoice.customer;
-    const subscriptionId = invoice.subscription;
+    // PROD-54: newer API versions moved the subscription ID under invoice.parent
+    const subscriptionId = invoice.subscription
+        ?? invoice.parent?.subscription_details?.subscription;
 
     if (!subscriptionId) {
         console.log('No subscription on invoice, skipping');
@@ -158,8 +174,7 @@ async function handleInvoicePaid(invoice) {
 
     // Get subscription details for period dates
     const sub = await stripe.subscriptions.retrieve(subscriptionId);
-    const periodStart = new Date(sub.current_period_start * 1000).toISOString();
-    const periodEnd = new Date(sub.current_period_end * 1000).toISOString();
+    const { periodStart, periodEnd } = getPeriodDates(sub);
 
     // Reset usage counters
     const { error } = await supabase
@@ -168,8 +183,9 @@ async function handleInvoicePaid(invoice) {
             analyses_used: 0,
             resumes_used: 0,
             covers_used: 0,
-            current_period_start: periodStart,
-            current_period_end: periodEnd,
+            // PROD-54: never overwrite stored dates with nulls
+            ...(periodStart && { current_period_start: periodStart }),
+            ...(periodEnd && { current_period_end: periodEnd }),
             updated_at: new Date().toISOString()
         })
         .eq('stripe_subscription_id', subscriptionId);
@@ -196,8 +212,9 @@ async function handleSubscriptionUpdated(subscription) {
     const newTier = PRICE_TO_TIER[priceId] || 'pro';
     const limits = TIER_LIMITS[newTier] || TIER_LIMITS.pro;
 
-    const periodStart = new Date(subscription.current_period_start * 1000).toISOString();
-    const periodEnd = new Date(subscription.current_period_end * 1000).toISOString();
+    // PROD-54: read period dates from either field layout (the event payload follows
+    // the webhook endpoint's API version, not the library's)
+    const { periodStart, periodEnd } = getPeriodDates(subscription);
 
     const updateData = {
         tier: newTier,
@@ -206,8 +223,9 @@ async function handleSubscriptionUpdated(subscription) {
         analyses_limit: limits.analyses,
         resumes_limit: limits.resumes,
         covers_limit: limits.covers,
-        current_period_start: periodStart,
-        current_period_end: periodEnd,
+        // PROD-54: never overwrite stored dates with nulls
+        ...(periodStart && { current_period_start: periodStart }),
+        ...(periodEnd && { current_period_end: periodEnd }),
         updated_at: new Date().toISOString()
     };
 
