@@ -20,7 +20,7 @@ const PRICE_TO_TIER = {
  * NULL = unlimited
  */
 const TIER_LIMITS = {
-    free: { analyses: 10, resumes: 0, covers: 0 },
+    free: { analyses: null, resumes: 3, covers: 0 },
     lite: { analyses: null, resumes: 10, covers: 10 },
     pro: { analyses: null, resumes: null, covers: null }
 };
