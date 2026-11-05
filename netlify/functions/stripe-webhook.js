@@ -1,5 +1,7 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { createClient } = require('@supabase/supabase-js');
+const { templates, sendBillingEmailOnce } = require('../lib/billing-email');
+const { manageLinkFor } = require('../lib/manage-link');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -40,6 +42,38 @@ function getPeriodDates(sub) {
     };
 }
 
+// PROD-43: tiers that get billing emails (never free or beta)
+const PAID_TIERS = ['lite', 'pro'];
+
+// PROD-54/PROD-43: subscription ID from either invoice field layout
+function getInvoiceSubscriptionId(invoice) {
+    return invoice.subscription ?? invoice.parent?.subscription_details?.subscription ?? null;
+}
+
+// PROD-43: price ID of the invoice's first line, from either field layout
+function getInvoicePriceId(invoice) {
+    const line = invoice.lines?.data?.[0];
+    return line?.price?.id ?? line?.pricing?.price_details?.price ?? null;
+}
+
+// PROD-43: subscriber's email: MatchMentum account first, Stripe customer as fallback
+async function getRecipientEmail(userId, customerId) {
+    if (userId) {
+        const { data, error } = await supabase.auth.admin.getUserById(userId);
+        if (!error && data?.user?.email) return data.user.email;
+        if (error) console.error(`[email] auth lookup failed for ${userId}:`, error.message);
+    }
+    if (customerId) {
+        try {
+            const customer = await stripe.customers.retrieve(customerId);
+            if (customer && !customer.deleted && customer.email) return customer.email;
+        } catch (err) {
+            console.error(`[email] Stripe customer lookup failed for ${customerId}:`, err.message);
+        }
+    }
+    return null;
+}
+
 exports.handler = async (event) => {
     if (event.httpMethod !== 'POST') {
         return { statusCode: 405, body: 'Method Not Allowed' };
@@ -66,15 +100,19 @@ exports.handler = async (event) => {
                 break;
 
             case 'invoice.paid':
-                await handleInvoicePaid(stripeEvent.data.object);
+                await handleInvoicePaid(stripeEvent.data.object, stripeEvent);
+                break;
+
+            case 'invoice.upcoming':
+                await handleInvoiceUpcoming(stripeEvent.data.object, stripeEvent);
                 break;
 
             case 'customer.subscription.updated':
-                await handleSubscriptionUpdated(stripeEvent.data.object);
+                await handleSubscriptionUpdated(stripeEvent.data.object, stripeEvent);
                 break;
 
             case 'customer.subscription.deleted':
-                await handleSubscriptionDeleted(stripeEvent.data.object);
+                await handleSubscriptionDeleted(stripeEvent.data.object, stripeEvent);
                 break;
 
             default:
@@ -153,16 +191,19 @@ async function handleCheckoutComplete(session) {
  * Handle invoice.paid
  * Resets monthly usage counters at the start of each billing cycle
  */
-async function handleInvoicePaid(invoice) {
+async function handleInvoicePaid(invoice, stripeEvent) {
     const customerId = invoice.customer;
     // PROD-54: newer API versions moved the subscription ID under invoice.parent
-    const subscriptionId = invoice.subscription
-        ?? invoice.parent?.subscription_details?.subscription;
+    const subscriptionId = getInvoiceSubscriptionId(invoice);
 
     if (!subscriptionId) {
         console.log('No subscription on invoice, skipping');
         return;
     }
+
+    // PROD-43: receipt for every successful charge, first charge included.
+    // Sent before the first-invoice return below; never throws.
+    await sendReceipt(invoice, stripeEvent, subscriptionId);
 
     // Skip the first invoice (handled by checkout.session.completed)
     if (invoice.billing_reason === 'subscription_create') {
@@ -199,10 +240,123 @@ async function handleInvoicePaid(invoice) {
 }
 
 /**
+ * PROD-43: receipt after a successful charge.
+ * On the first charge the subscriptions row may not exist yet (checkout.session.completed
+ * can arrive later), so the plan comes from the invoice's price and the address from the
+ * invoice, with the row and Stripe customer as fallbacks.
+ */
+async function sendReceipt(invoice, stripeEvent, subscriptionId) {
+    try {
+        if (!(invoice.amount_paid > 0)) {
+            console.log('[email] receipt: nothing charged, skipping');
+            return;
+        }
+
+        const { data: row } = await supabase
+            .from('subscriptions')
+            .select('user_id, tier')
+            .eq('stripe_subscription_id', subscriptionId)
+            .maybeSingle();
+
+        const tier = PRICE_TO_TIER[getInvoicePriceId(invoice)] || row?.tier;
+        if (!PAID_TIERS.includes(tier)) {
+            console.log(`[email] receipt: tier ${tier} is not a paid tier, skipping`);
+            return;
+        }
+
+        const to = invoice.customer_email || await getRecipientEmail(row?.user_id, invoice.customer);
+        await sendBillingEmailOnce(supabase, {
+            eventId: stripeEvent.id,
+            emailType: 'receipt',
+            userId: row?.user_id,
+            to,
+            template: templates.receipt({
+                tier,
+                amount: invoice.amount_paid,
+                currency: invoice.currency,
+                paidDate: invoice.status_transitions?.paid_at || invoice.created,
+                invoiceUrl: invoice.hosted_invoice_url,
+                manageUrl: manageLinkFor(invoice.customer)
+            })
+        });
+    } catch (err) {
+        console.error('[email] receipt failed:', err.message);
+    }
+}
+
+/**
+ * PROD-43: handle invoice.upcoming (Stripe sends it 7 days before renewal, per the
+ * Billing setting). Sends the renewal reminder, or the cancel-first version when
+ * nothing was used this period. Lite and Pro only.
+ */
+async function handleInvoiceUpcoming(invoice, stripeEvent) {
+    const subscriptionId = getInvoiceSubscriptionId(invoice);
+    if (!subscriptionId) {
+        console.log('[email] upcoming invoice has no subscription, skipping');
+        return;
+    }
+
+    const { data: row, error } = await supabase
+        .from('subscriptions')
+        .select('user_id, tier, stripe_customer_id, analyses_used, analyses_limit, resumes_used, resumes_limit, covers_used, covers_limit')
+        .eq('stripe_subscription_id', subscriptionId)
+        .maybeSingle();
+
+    if (error) {
+        console.error('[email] subscription lookup failed:', error.message);
+        return;
+    }
+    if (!row || !PAID_TIERS.includes(row.tier)) {
+        console.log(`[email] reminder: no paid subscription row for ${subscriptionId}, skipping`);
+        return;
+    }
+    if (!(invoice.amount_due > 0)) {
+        console.log('[email] reminder: nothing due, skipping');
+        return;
+    }
+
+    // Don't remind people whose plan won't renew
+    const sub = await stripe.subscriptions.retrieve(subscriptionId);
+    if (sub.status !== 'active' || sub.cancel_at_period_end || sub.cancel_at) {
+        console.log(`[email] reminder: subscription ${subscriptionId} will not renew, skipping`);
+        return;
+    }
+
+    const { periodEnd } = getPeriodDates(sub);
+    const chargeDate = invoice.next_payment_attempt || periodEnd;
+    const customerId = row.stripe_customer_id || invoice.customer;
+    const usage = {
+        analyses: row.analyses_used || 0,
+        resumes: row.resumes_used || 0,
+        covers: row.covers_used || 0
+    };
+    const limits = { analyses: row.analyses_limit, resumes: row.resumes_limit, covers: row.covers_limit };
+    const zeroUsage = usage.analyses === 0 && usage.resumes === 0 && usage.covers === 0;
+
+    const details = {
+        tier: row.tier,
+        amount: invoice.amount_due,
+        currency: invoice.currency,
+        chargeDate,
+        usage,
+        limits,
+        manageUrl: manageLinkFor(customerId)
+    };
+
+    await sendBillingEmailOnce(supabase, {
+        eventId: stripeEvent.id,
+        emailType: zeroUsage ? 'renewal_reminder_zero_usage' : 'renewal_reminder',
+        userId: row.user_id,
+        to: await getRecipientEmail(row.user_id, customerId),
+        template: zeroUsage ? templates.zeroUsageReminder(details) : templates.renewalReminder(details)
+    });
+}
+
+/**
  * Handle customer.subscription.updated
  * Handles plan upgrades/downgrades
  */
-async function handleSubscriptionUpdated(subscription) {
+async function handleSubscriptionUpdated(subscription, stripeEvent) {
     const subscriptionId = subscription.id;
     const priceId = subscription.items?.data?.[0]?.price?.id;
     const status = subscription.status;
@@ -247,16 +401,54 @@ async function handleSubscriptionUpdated(subscription) {
     }
 
     console.log(`Subscription ${subscriptionId} updated to ${newTier}`);
+
+    // PROD-43: confirmation when the subscriber cancels (access continues to period end).
+    // Fires only on the update where cancellation was just scheduled.
+    const prev = stripeEvent?.data?.previous_attributes || {};
+    const nowScheduled = subscription.cancel_at_period_end === true || !!subscription.cancel_at;
+    const justScheduled = nowScheduled &&
+        (prev.cancel_at_period_end === false || ('cancel_at' in prev && !prev.cancel_at));
+
+    if (justScheduled && PAID_TIERS.includes(newTier)) {
+        try {
+            const { data: row } = await supabase
+                .from('subscriptions')
+                .select('user_id')
+                .eq('stripe_subscription_id', subscriptionId)
+                .maybeSingle();
+
+            await sendBillingEmailOnce(supabase, {
+                eventId: stripeEvent.id,
+                emailType: 'cancellation_scheduled',
+                userId: row?.user_id,
+                to: await getRecipientEmail(row?.user_id, subscription.customer),
+                template: templates.cancellationScheduled({
+                    tier: newTier,
+                    accessEndDate: subscription.cancel_at || periodEnd,
+                    manageUrl: manageLinkFor(subscription.customer)
+                })
+            });
+        } catch (err) {
+            console.error('[email] cancellation confirmation failed:', err.message);
+        }
+    }
 }
 
 /**
  * Handle customer.subscription.deleted
  * Downgrades user to free tier when subscription is canceled
  */
-async function handleSubscriptionDeleted(subscription) {
+async function handleSubscriptionDeleted(subscription, stripeEvent) {
     const subscriptionId = subscription.id;
 
     console.log(`Subscription deleted: ${subscriptionId}`);
+
+    // PROD-43: read who this was before the update below clears stripe_subscription_id
+    const { data: endedRow } = await supabase
+        .from('subscriptions')
+        .select('user_id, tier, stripe_customer_id')
+        .eq('stripe_subscription_id', subscriptionId)
+        .maybeSingle();
 
     const limits = TIER_LIMITS.free;
 
@@ -285,4 +477,23 @@ async function handleSubscriptionDeleted(subscription) {
     }
 
     console.log(`Subscription ${subscriptionId} canceled, user downgraded to free`);
+
+    // PROD-43: "your plan has ended" email (paid tiers only)
+    if (endedRow && PAID_TIERS.includes(endedRow.tier)) {
+        try {
+            const customerId = endedRow.stripe_customer_id || subscription.customer;
+            await sendBillingEmailOnce(supabase, {
+                eventId: stripeEvent.id,
+                emailType: 'subscription_ended',
+                userId: endedRow.user_id,
+                to: await getRecipientEmail(endedRow.user_id, customerId),
+                template: templates.subscriptionEnded({
+                    tier: endedRow.tier,
+                    endedDate: subscription.ended_at || Math.floor(Date.now() / 1000)
+                })
+            });
+        } catch (err) {
+            console.error('[email] subscription ended email failed:', err.message);
+        }
+    }
 }
